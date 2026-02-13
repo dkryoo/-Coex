@@ -1,6 +1,13 @@
 # TX_NarrowBand.py
 import numpy as np
 
+REGULATORY_EIRP_DBW = {
+    "unlicensed_6g_lpi_ap": 0.0,
+    "unlicensed_6g_lpi_client": -6.0,
+    "unlicensed_6g_vlp": -16.0,
+}
+
+
 def generate_mseq32():
     """Simple 32-bit m-seq from 5-bit LFSR taps x^5 + x^2 + 1."""
     reg = [1, 1, 1, 1, 1]
@@ -144,6 +151,63 @@ class OQPSK_SF32_Tx:
         wf = I_wave + 1j * Q_wave
         wf = wf / np.sqrt(np.mean(np.abs(wf) ** 2) + 1e-30)
         return wf.astype(np.complex128)
+
+    @staticmethod
+    def db_to_w(db: float) -> float:
+        return 10.0 ** (db / 10.0)
+
+    def resolve_eirp_db(self, tx_eirp_db: float | None, regulatory_profile: str) -> float:
+        if tx_eirp_db is not None:
+            return float(tx_eirp_db)
+        if regulatory_profile not in REGULATORY_EIRP_DBW:
+            raise ValueError(
+                f"Unknown regulatory_profile '{regulatory_profile}'. "
+                f"Available: {list(REGULATORY_EIRP_DBW.keys())}"
+            )
+        return float(REGULATORY_EIRP_DBW[regulatory_profile])
+
+    def scale_waveform_to_eirp(
+        self,
+        wf: np.ndarray,
+        tx_eirp_db: float | None = None,
+        regulatory_profile: str = "unlicensed_6g_lpi_ap",
+        ant_gain_tx_db: float = 0.0,
+        cable_loss_tx_db: float = 0.0,
+    ) -> tuple[np.ndarray, float]:
+        """
+        Scale waveform to target EIRP (dBW).
+        Returns (scaled_waveform, resolved_eirp_db).
+        """
+        eirp_db = self.resolve_eirp_db(tx_eirp_db, regulatory_profile)
+        p_cond_db = eirp_db - ant_gain_tx_db + cable_loss_tx_db
+        p_cond_w = self.db_to_w(p_cond_db)
+
+        p_now = float(np.mean(np.abs(wf) ** 2)) + 1e-30
+        scaled = wf * np.sqrt(p_cond_w / p_now)
+        return scaled.astype(np.complex128), eirp_db
+
+    def build_tx_waveform(
+        self,
+        psdu_bits: np.ndarray,
+        tx_eirp_db: float | None = None,
+        regulatory_profile: str = "unlicensed_6g_lpi_ap",
+        ant_gain_tx_db: float = 0.0,
+        cable_loss_tx_db: float = 0.0,
+    ) -> tuple[np.ndarray, int, float]:
+        """
+        Build frame waveform and scale to target EIRP.
+        Returns (tx_waveform, psdu_len_bytes, resolved_eirp_db).
+        """
+        frame_bits, psdu_len_bytes = self.build_frame_bits(psdu_bits)
+        wf = self.bits_to_baseband(frame_bits)
+        wf_scaled, eirp_db = self.scale_waveform_to_eirp(
+            wf=wf,
+            tx_eirp_db=tx_eirp_db,
+            regulatory_profile=regulatory_profile,
+            ant_gain_tx_db=ant_gain_tx_db,
+            cable_loss_tx_db=cable_loss_tx_db,
+        )
+        return wf_scaled, psdu_len_bytes, eirp_db
 
 
 if __name__ == "__main__":

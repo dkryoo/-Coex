@@ -163,7 +163,6 @@ class OQPSK_SF32_Rx:
 
         return psdu_bits, psdu_len_bytes, sfd_score
 
-
 if __name__ == "__main__":
     chip_rate_hz = 2e6
     osr = 8

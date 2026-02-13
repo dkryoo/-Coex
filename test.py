@@ -2,36 +2,7 @@ import numpy as np
 
 from NarrowBand.TX_NarrowBand import OQPSK_SF32_Tx
 from NarrowBand.RX_NarrowBand import OQPSK_SF32_Rx
-from Channel.Rician import apply_distance_rician_channel
-from Channel.Thermal_noise import add_thermal_noise_white
-
-
-def dbm_to_w(dbm: float) -> float:
-    return 10.0 ** ((dbm - 30.0) / 10.0)
-
-
-def scale_waveform_to_psd(
-    wf: np.ndarray,
-    psd_dbm_per_mhz: float,
-    bw_hz: float,
-    ant_gain_tx_db: float = 0.0,
-    cable_loss_tx_db: float = 0.0,
-) -> np.ndarray:
-    """
-    Scale mean(|wf|^2) to conducted Tx power from PSD target.
-
-    EIRP(dBm) = PSD(dBm/MHz) + 10log10(BW/1e6)
-    P_cond(dBm) = EIRP - Gt + Lcable_tx
-    """
-    if bw_hz <= 0:
-        raise ValueError("bw_hz must be > 0")
-
-    eirp_dbm = psd_dbm_per_mhz + 10.0 * np.log10(bw_hz / 1e6)
-    p_cond_dbm = eirp_dbm - ant_gain_tx_db + cable_loss_tx_db
-    p_cond_w = dbm_to_w(p_cond_dbm)
-
-    p_now = float(np.mean(np.abs(wf) ** 2)) + 1e-30
-    return wf * np.sqrt(p_cond_w / p_now)
+from Channel.Rician import apply_distance_rician_channel_with_thermal_noise
 
 
 def run_distance_ber_test(
@@ -47,8 +18,9 @@ def run_distance_ber_test(
     powers_db=(0.0, -6.0, -10.0),
     nf_db: float = 6.0,
     temperature_k: float = 290.0,
-    psd_dbm_per_mhz: float = -41.3,
-    bw_hz: float = 2e6,
+    noise_ref_bw_hz: float = 2e6,
+    tx_eirp_db: float | None = None,
+    regulatory_profile: str = "unlicensed_6g_lpi_ap",
     rx_lead_zeros: int = 80,
     seed_base: int = 1234,
 ):
@@ -62,6 +34,11 @@ def run_distance_ber_test(
         f"fs={tx.fs/1e6:.3f} Msps, fc={fc_hz/1e9:.3f} GHz, "
         f"iters={iters_per_distance}, bit_len={bit_len}, distances={min(distances_m)}..{max(distances_m)} m"
     )
+    resolved_eirp_db = tx.resolve_eirp_db(tx_eirp_db=tx_eirp_db, regulatory_profile=regulatory_profile)
+    print(
+        f"profile={regulatory_profile}, EIRP={resolved_eirp_db:.2f} dBW, "
+        f"noise_ref_bw={noise_ref_bw_hz/1e6:.3f} MHz"
+    )
 
     for d in distances_m:
         total_err = 0
@@ -72,33 +49,30 @@ def run_distance_ber_test(
             rng = np.random.default_rng(seed_base + 10000 * d + i)
             tx_bits = rng.integers(0, 2, bit_len, dtype=int)
 
-            frame_bits, _ = tx.build_frame_bits(tx_bits)
-            tx_wf = tx.bits_to_baseband(frame_bits)
-            tx_wf = scale_waveform_to_psd(
-                tx_wf,
-                psd_dbm_per_mhz=psd_dbm_per_mhz,
-                bw_hz=bw_hz,
+            tx_wf, _, resolved_eirp_db = tx.build_tx_waveform(
+                psdu_bits=tx_bits,
+                tx_eirp_db=resolved_eirp_db,
+                regulatory_profile=regulatory_profile,
             )
-
-            ch_wf, _, _ = apply_distance_rician_channel(
-                wf=tx_wf,
+            rx_wf, info = apply_distance_rician_channel_with_thermal_noise(
+                tx_wf=tx_wf,
                 fs_hz=tx.fs,
                 fc_hz=fc_hz,
                 distance_m=float(d),
+                tx_eirp_db=resolved_eirp_db,
                 pathloss_exp=pathloss_exp,
+                ref_distance_m=1.0,
                 delays_s=delays_s,
                 powers_db=powers_db,
                 k_factor_db=k_factor_db,
-                seed=seed_base + 200000 + 10000 * d + i,
-            )
-
-            rx_wf = np.concatenate([np.zeros(rx_lead_zeros, dtype=np.complex128), ch_wf])
-            rx_wf = add_thermal_noise_white(
-                wf=rx_wf,
-                fs_hz=tx.fs,
                 nf_db=nf_db,
                 temperature_k=temperature_k,
-                seed=seed_base + 300000 + 10000 * d + i,
+                noise_ref_bw_hz=noise_ref_bw_hz,
+                rx_ant_gain_db=0.0,
+                rx_cable_loss_db=0.0,
+                rx_lead_zeros=rx_lead_zeros,
+                channel_seed=seed_base + 200000 + 10000 * d + i,
+                noise_seed=seed_base + 300000 + 10000 * d + i,
             )
 
             try:
@@ -112,7 +86,15 @@ def run_distance_ber_test(
         ber = total_err / total_bits
         ok_pct = 100.0 * ok_count / iters_per_distance
         results.append((int(d), float(ber), float(ok_pct)))
-        print(f"d={d:2d} m | BER={ber:.6e} | decode_ok={ok_pct:5.1f}%")
+        pl_db = info["pathloss_db"]
+        pr_dbw = info["pr_dbw"]
+        noise_dbw_ref = info["noise_dbw_ref_bw"]
+        snr_db_ref = info["snr_db_ref_bw"]
+        print(
+            f"d={d:2d} m | BER={ber:.6e} | decode_ok={ok_pct:5.1f}% "
+            f"| PL={pl_db:6.2f} dB | Pr={pr_dbw:7.2f} dBW "
+            f"| N={noise_dbw_ref:7.2f} dBW | SNR={snr_db_ref:6.2f} dB"
+        )
 
     return results
 
@@ -130,8 +112,9 @@ if __name__ == "__main__":
         delays_s=(0.0, 50e-9, 120e-9),
         powers_db=(0.0, -6.0, -10.0),
         nf_db=6.0,
-        psd_dbm_per_mhz=-41.3,
-        bw_hz=2e6,
+        noise_ref_bw_hz=2e6,
+        tx_eirp_db=None,
+        regulatory_profile="unlicensed_6g_lpi_ap",
         rx_lead_zeros=80,
         seed_base=1234,
     )
