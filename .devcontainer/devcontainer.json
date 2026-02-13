@@ -1,0 +1,24 @@
+{
+  "name": "coex", 
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  },
+  
+  // [옵션] 실제 도커 컨테이너 이름도 'coex'로 고정 (Docker Desktop 목록에 coex로 뜸)
+  "runArgs": ["--name", "coex"],
+
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+  "remoteUser": "root"
+}

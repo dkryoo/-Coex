@@ -1,0 +1,3 @@
+numpy
+pandas
+# 그 외 필요한 것들 (예: scikit-learn 등)
