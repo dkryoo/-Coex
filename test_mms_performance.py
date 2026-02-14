@@ -3,7 +3,7 @@ from simulation.mms.performance import simulate_mms_performance
 
 def main() -> None:
     print("=== MMS Performance (Initiation assumed complete) ===")
-    print("Model: symbolic MMS phase + RMarker-wise timing over Rician+thermal-noise channel")
+    print("Model: symbolic MMS phase + RMarker-wise timing (legacy detector default)")
 
     rows = simulate_mms_performance(
         distances_m=(5.0, 10.0, 20.0, 40.0),
