@@ -1,6 +1,6 @@
 import unittest
 
-from NarrowBand.compact_frames import (
+from packet.narrowband_compact_frames import (
     AdvConf,
     AdvPoll,
     AdvResp,
