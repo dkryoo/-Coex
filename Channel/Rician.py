@@ -95,13 +95,14 @@ def apply_distance_rician_channel(
     k_factor_db: float = 8.0,
     rx_ant_gain_db: float = 0.0,
     rx_cable_loss_db: float = 0.0,
+    include_toa: bool = True,
     seed: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float, int]:
     """
     Apply distance-based large-scale loss + small-scale Rician multipath.
 
     Returns:
-      rx_wf, h, pathloss_db
+      rx_wf, h, pathloss_db, toa_s, toa_samples
     """
     pl_db = log_distance_pathloss_db(
         fc_hz=fc_hz,
@@ -110,9 +111,13 @@ def apply_distance_rician_channel(
         ref_distance_m=ref_distance_m,
     )
 
+    toa_s = max(distance_m, 0.0) / C0 if include_toa else 0.0
+    toa_samples = int(np.round(toa_s * fs_hz))
+    delays_eff_s = tuple(float(toa_s + d) for d in delays_s)
+
     h = rician_multipath_channel(
         fs_hz=fs_hz,
-        delays_s=delays_s,
+        delays_s=delays_eff_s,
         powers_db=powers_db,
         k_factor_db=k_factor_db,
         seed=seed,
@@ -123,7 +128,7 @@ def apply_distance_rician_channel(
     amp_scale = 10.0 ** (power_scale_db / 20.0)
 
     rx_wf = np.convolve(wf, h, mode="full") * amp_scale
-    return rx_wf, h, pl_db
+    return rx_wf, h, pl_db, toa_s, toa_samples
 
 
 def apply_distance_rician_channel_with_thermal_noise(
@@ -142,6 +147,7 @@ def apply_distance_rician_channel_with_thermal_noise(
     noise_ref_bw_hz: float | None = None,
     rx_ant_gain_db: float = 0.0,
     rx_cable_loss_db: float = 0.0,
+    include_toa: bool = True,
     rx_lead_zeros: int = 80,
     channel_seed: int | None = None,
     noise_seed: int | None = None,
@@ -154,7 +160,7 @@ def apply_distance_rician_channel_with_thermal_noise(
       rx_wf: received waveform after channel+noise
       info: link-budget dictionary in dB scale (dBW reference)
     """
-    ch_wf, h, pl_db = apply_distance_rician_channel(
+    ch_wf, h, pl_db, toa_s, toa_samples = apply_distance_rician_channel(
         wf=tx_wf,
         fs_hz=fs_hz,
         fc_hz=fc_hz,
@@ -166,6 +172,7 @@ def apply_distance_rician_channel_with_thermal_noise(
         k_factor_db=k_factor_db,
         rx_ant_gain_db=rx_ant_gain_db,
         rx_cable_loss_db=rx_cable_loss_db,
+        include_toa=include_toa,
         seed=channel_seed,
     )
 
@@ -203,6 +210,8 @@ def apply_distance_rician_channel_with_thermal_noise(
         "noise_ref_bw_hz": float(noise_ref_bw_hz),
         "snr_db_sample_rate": float(snr_db_sample),
         "snr_db_ref_bw": float(snr_db_ref),
+        "toa_s": float(toa_s),
+        "toa_samples": int(toa_samples),
         "h": h,
     }
     return rx_wf, info
