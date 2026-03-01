@@ -198,15 +198,20 @@ def apply_distance_rician_channel_with_thermal_noise(
     noise_dbw_ref = 10.0 * np.log10(max(noise_power_w_ref, 1e-30))
 
     pr_dbw = tx_eirp_db + rx_ant_gain_db - pl_db - rx_cable_loss_db
+    pr_dbm = pr_dbw + 30.0
     snr_db_sample = pr_dbw - noise_dbw_sample
     snr_db_ref = pr_dbw - noise_dbw_ref
 
     info = {
         "pathloss_db": float(pl_db),
         "pr_dbw": float(pr_dbw),
+        "pr_dbm": float(pr_dbm),
         "eirp_dbw": float(tx_eirp_db),
+        "eirp_dbm": float(tx_eirp_db + 30.0),
         "noise_dbw_sample_rate": float(noise_dbw_sample),
+        "noise_dbm_sample_rate": float(noise_dbw_sample + 30.0),
         "noise_dbw_ref_bw": float(noise_dbw_ref),
+        "noise_dbm_ref_bw": float(noise_dbw_ref + 30.0),
         "noise_ref_bw_hz": float(noise_ref_bw_hz),
         "snr_db_sample_rate": float(snr_db_sample),
         "snr_db_ref_bw": float(snr_db_ref),

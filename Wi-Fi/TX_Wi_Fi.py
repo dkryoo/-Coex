@@ -298,6 +298,95 @@ class WiFiOFDMTx:
         }
         return wf.astype(np.complex128), info
 
+    def apply_tx_emission_mask(
+        self,
+        wf: np.ndarray,
+        fs_hz: float,
+        channel_bw_hz: float,
+        aclr_db: float = 35.0,
+        oob_floor_db: float = -50.0,
+        rolloff_hz: float = 2e6,
+        seed: int | None = None,
+    ) -> np.ndarray:
+        """
+        Add finite out-of-band emission component to emulate non-ideal TX ACLR.
+
+        Returns a waveform with:
+        - original in-band component preserved
+        - additional OOB-shaped component scaled by ACLR (dBc)
+        """
+        x = np.asarray(wf, dtype=np.complex128).flatten()
+        if x.size == 0:
+            return x
+        if fs_hz <= 0 or channel_bw_hz <= 0:
+            raise ValueError("fs_hz and channel_bw_hz must be > 0")
+
+        rng = np.random.default_rng(seed if seed is not None else int(self.rng.integers(0, 2**31 - 1)))
+        n = x.size
+        nfft = int(2 ** np.ceil(np.log2(max(2048, n))))
+        f = np.fft.fftfreq(nfft, d=1.0 / fs_hz)
+        fa = np.abs(f)
+        bw2 = 0.5 * channel_bw_hz
+
+        # OOB mask: 0 inside band, 1 outside; soft edge with rolloff.
+        oob_mask = np.ones(nfft, dtype=float)
+        inband = fa <= bw2
+        oob_mask[inband] = 0.0
+        if rolloff_hz > 0:
+            tr = (fa > bw2) & (fa < (bw2 + rolloff_hz))
+            if np.any(tr):
+                u = (fa[tr] - bw2) / rolloff_hz
+                oob_mask[tr] = 0.5 * (1.0 - np.cos(np.pi * u))
+
+        w = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex128)
+        W = np.fft.fft(w, n=nfft)
+        W *= oob_mask
+        w_oob = np.fft.ifft(W, n=nfft)[:n].astype(np.complex128)
+
+        p_in = float(np.mean(np.abs(x) ** 2)) + 1e-30
+        p_oob_target = p_in * (10.0 ** (-float(aclr_db) / 10.0))
+        p_oob_now = float(np.mean(np.abs(w_oob) ** 2)) + 1e-30
+        w_oob = w_oob * np.sqrt(p_oob_target / p_oob_now)
+
+        # Optional uniform wideband floor (very low power).
+        floor_rel = 10.0 ** (float(oob_floor_db) / 10.0)
+        if floor_rel > 0:
+            w_floor = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex128)
+            p_floor_now = float(np.mean(np.abs(w_floor) ** 2)) + 1e-30
+            w_floor *= np.sqrt((p_in * floor_rel) / p_floor_now)
+        else:
+            w_floor = 0.0
+
+        return (x + w_oob + w_floor).astype(np.complex128)
+
+    @staticmethod
+    def estimate_aclr_db(
+        wf: np.ndarray,
+        fs_hz: float,
+        channel_bw_hz: float,
+        guard_hz: float = 2e6,
+    ) -> float:
+        """
+        Rough ACLR-like metric from FFT PSD:
+        10log10(P_inband / P_adjacent_oob).
+        """
+        x = np.asarray(wf, dtype=np.complex128).flatten()
+        if x.size == 0:
+            return float("nan")
+        if fs_hz <= 0 or channel_bw_hz <= 0:
+            raise ValueError("fs_hz and channel_bw_hz must be > 0")
+        nfft = int(2 ** np.ceil(np.log2(max(4096, x.size))))
+        X = np.fft.fftshift(np.fft.fft(x, n=nfft))
+        ps = (np.abs(X) ** 2) / max(nfft, 1)
+        f = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / fs_hz))
+        fa = np.abs(f)
+        bw2 = 0.5 * channel_bw_hz
+        inband = fa <= bw2
+        adj = (fa > (bw2 + max(0.0, guard_hz))) & (fa <= (bw2 + max(0.0, guard_hz) + channel_bw_hz))
+        p_in = float(np.sum(ps[inband])) + 1e-30
+        p_adj = float(np.sum(ps[adj])) + 1e-30
+        return 10.0 * np.log10(p_in / p_adj)
+
     @staticmethod
     def save_waveform_preview_png(
         wf: np.ndarray,
