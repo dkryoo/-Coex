@@ -40,6 +40,8 @@ def rician_multipath_channel(
     delays_s: list[float] | tuple[float, ...],
     powers_db: list[float] | tuple[float, ...],
     k_factor_db: float = 8.0,
+    fractional_delay: bool = False,
+    frac_taps: int = 33,
     seed: int | None = None,
 ) -> np.ndarray:
     """
@@ -64,21 +66,53 @@ def rician_multipath_channel(
     tap_powers_lin = 10.0 ** (np.asarray(powers_db, dtype=float) / 10.0)
     tap_powers_lin = tap_powers_lin / (tap_powers_lin.sum() + 1e-30)
 
-    sample_delays = np.round(delays_s * fs_hz).astype(int)
-    h = np.zeros(int(sample_delays.max()) + 1, dtype=np.complex128)
+    delay_samples_f = delays_s * fs_hz
+    frac_mode = bool(fractional_delay)
+    if not frac_mode:
+        sample_delays = np.round(delay_samples_f).astype(int)
+        h = np.zeros(int(sample_delays.max()) + 1, dtype=np.complex128)
+    else:
+        taps = int(max(5, frac_taps))
+        if taps % 2 == 0:
+            taps += 1
+        half = taps // 2
+        # Reserve an integer left-shift so near-delay sinc kernels are not
+        # truncated at n<0 (this truncation biases short-distance ToA).
+        max_idx = int(np.ceil(np.max(delay_samples_f))) + (2 * half) + 2
+        h = np.zeros(max_idx + 1, dtype=np.complex128)
 
     k_lin = 10.0 ** (k_factor_db / 10.0)
 
-    for tap_idx, (d_samp, p_lin) in enumerate(zip(sample_delays, tap_powers_lin)):
+    for tap_idx, (d_samp_f, p_lin) in enumerate(zip(delay_samples_f, tap_powers_lin)):
         if tap_idx == 0:
             phase = rng.uniform(0.0, 2.0 * np.pi)
             los = np.sqrt(k_lin / (k_lin + 1.0)) * np.sqrt(p_lin) * np.exp(1j * phase)
             scatter = np.sqrt(1.0 / (k_lin + 1.0)) * np.sqrt(p_lin / 2.0) * (
                 rng.standard_normal() + 1j * rng.standard_normal()
             )
-            h[d_samp] += los + scatter
+            tap_gain = los + scatter
         else:
-            h[d_samp] += np.sqrt(p_lin / 2.0) * (rng.standard_normal() + 1j * rng.standard_normal())
+            tap_gain = np.sqrt(p_lin / 2.0) * (rng.standard_normal() + 1j * rng.standard_normal())
+
+        if not frac_mode:
+            d_samp = int(np.round(d_samp_f))
+            h[d_samp] += tap_gain
+        else:
+            taps = int(max(5, frac_taps))
+            if taps % 2 == 0:
+                taps += 1
+            half = taps // 2
+            n0 = int(np.floor(d_samp_f))
+            # Shift support by +half so negative kernel indices are represented.
+            n_phys = np.arange(n0 - half, n0 + half + 1, dtype=int)
+            n = n_phys + half
+            w = np.sinc(n_phys - d_samp_f)
+            # Smooth window to limit truncation ripple.
+            win = np.hanning(len(n))
+            w = w * win
+            w = w / (np.sum(w) + 1e-30)
+            valid = (n >= 0) & (n < len(h))
+            h[n[valid]] += tap_gain * w[valid]
 
     return h
 
@@ -93,6 +127,8 @@ def apply_distance_rician_channel(
     delays_s: tuple[float, ...] = (0.0, 50e-9, 120e-9),
     powers_db: tuple[float, ...] = (0.0, -6.0, -10.0),
     k_factor_db: float = 8.0,
+    fractional_delay: bool = False,
+    frac_taps: int = 33,
     rx_ant_gain_db: float = 0.0,
     rx_cable_loss_db: float = 0.0,
     include_toa: bool = True,
@@ -120,6 +156,8 @@ def apply_distance_rician_channel(
         delays_s=delays_eff_s,
         powers_db=powers_db,
         k_factor_db=k_factor_db,
+        fractional_delay=bool(fractional_delay),
+        frac_taps=int(frac_taps),
         seed=seed,
     )
 
@@ -128,6 +166,15 @@ def apply_distance_rician_channel(
     amp_scale = 10.0 ** (power_scale_db / 20.0)
 
     rx_wf = np.convolve(wf, h, mode="full") * amp_scale
+    if bool(fractional_delay):
+        taps = int(max(5, frac_taps))
+        if taps % 2 == 0:
+            taps += 1
+        half = taps // 2
+        # Compensate the intentional +half shift inserted in
+        # `rician_multipath_channel` to preserve absolute ToA.
+        if half > 0 and rx_wf.size > half:
+            rx_wf = rx_wf[half:]
     return rx_wf, h, pl_db, toa_s, toa_samples
 
 

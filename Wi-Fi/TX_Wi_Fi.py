@@ -216,6 +216,104 @@ class WiFiOFDMTx:
         cp = x[-cp_n:]
         return np.concatenate([cp, x])
 
+    @staticmethod
+    def _all_signed_bins(fft_n: int) -> np.ndarray:
+        # Signed subcarrier indexing convention: k in [-N/2, ..., N/2-1]
+        return np.arange(-(fft_n // 2), fft_n // 2, dtype=int)
+
+    def build_debug_ofdm_grid(
+        self,
+        *,
+        channel_bw_mhz: int = 20,
+        standard: str = "wifi6e",
+        force_mcs: int | None = 0,
+        active_signed_subcarriers: np.ndarray | list[int] | None = None,
+        symbol_map_by_signed: dict[int, complex] | None = None,
+        fill_symbol: complex | None = None,
+    ) -> dict:
+        """
+        Build one OFDM symbol frequency grid (IFFT input) with metadata.
+
+        Notes:
+        - This returns the unshifted FFT-bin order X[0..Nfft-1] used by np.fft.ifft.
+        - DC is at signed k=0 and bin index 0 in this unshifted representation.
+        - If `active_signed_subcarriers` is None, full-band data bins from `_data_subcarrier_bins`
+          are used.
+        - If `symbol_map_by_signed` is provided, those exact signed tones are filled.
+        """
+        fs_hz, fft_n, cp_n, nsd = self._channel_params(channel_bw_mhz)
+        table = self._get_mcs_table(standard)
+        if force_mcs is None:
+            mcs = table[0]
+        else:
+            idx_map = {m.index: m for m in table}
+            if force_mcs not in idx_map:
+                max_idx = max(idx_map.keys())
+                raise ValueError(f"force_mcs must be within supported set for {standard} (max {max_idx})")
+            mcs = idx_map[force_mcs]
+
+        if symbol_map_by_signed is not None:
+            signed = np.asarray(sorted(int(k) for k in symbol_map_by_signed.keys()), dtype=int)
+        elif active_signed_subcarriers is not None:
+            signed = np.asarray([int(k) for k in active_signed_subcarriers], dtype=int)
+        else:
+            bins = self._data_subcarrier_bins(fft_n=fft_n, nsd=nsd)
+            signed = np.asarray([int(b if b < fft_n // 2 else b - fft_n) for b in bins], dtype=int)
+
+        if signed.size == 0:
+            raise ValueError("active signed subcarrier set is empty")
+        if np.any(signed == 0):
+            raise ValueError("DC subcarrier k=0 cannot be active")
+        if np.any(signed < -(fft_n // 2)) or np.any(signed > (fft_n // 2 - 1)):
+            raise ValueError("active signed subcarriers out of FFT range")
+
+        signed = np.unique(signed)
+        bins = (signed % fft_n).astype(int)
+
+        X = np.zeros(fft_n, dtype=np.complex128)
+        if symbol_map_by_signed is not None:
+            for k in signed:
+                X[int(k % fft_n)] = np.complex128(symbol_map_by_signed[int(k)])
+        elif fill_symbol is not None:
+            X[bins] = np.complex128(fill_symbol)
+        else:
+            n_cbps = int(signed.size) * mcs.n_bpsc
+            coded_bits = self.rng.integers(0, 2, n_cbps, dtype=int)
+            data_syms = self._qam_map(coded_bits, n_bpsc=mcs.n_bpsc)
+            X[bins] = data_syms
+
+        nonzero_bins = np.flatnonzero(np.abs(X) > 0).astype(int)
+        all_signed = self._all_signed_bins(fft_n)
+        occ_signed = np.asarray([int(b if b < fft_n // 2 else b - fft_n) for b in nonzero_bins], dtype=int)
+        occ_set = set(int(k) for k in occ_signed.tolist())
+        null_signed = np.asarray([int(k) for k in all_signed.tolist() if int(k) not in occ_set], dtype=int)
+        dc_index = int(0)
+        guard_signed = np.asarray([], dtype=int)
+        if occ_signed.size > 0:
+            kmin = int(np.min(occ_signed))
+            kmax = int(np.max(occ_signed))
+            guard_signed = np.asarray([int(k) for k in all_signed.tolist() if (k < kmin or k > kmax)], dtype=int)
+
+        x = np.fft.ifft(X, n=fft_n)
+        cp = x[-cp_n:]
+        sym_td = np.concatenate([cp, x]).astype(np.complex128)
+
+        return {
+            "sample_rate_hz": float(fs_hz),
+            "fft_n": int(fft_n),
+            "cp_n": int(cp_n),
+            "n_data_subcarriers_nominal": int(nsd),
+            "mcs_index": int(mcs.index),
+            "grid": X.astype(np.complex128),
+            "symbol_td": sym_td,
+            "dc_index": dc_index,
+            "occupied_bins": nonzero_bins.astype(int),
+            "occupied_signed": occ_signed.astype(int),
+            "null_signed": null_signed.astype(int),
+            "guard_signed": guard_signed.astype(int),
+            "indexing": "unshifted_fft_bins_with_signed_k_mapping",
+        }
+
     def generate_for_target_rx_throughput(
         self,
         target_rx_throughput_mbps: float,

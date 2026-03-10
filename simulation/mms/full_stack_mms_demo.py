@@ -53,7 +53,10 @@ def uwb_center_freq_hz(channel: int) -> float:
     # Common HRP-UWB channel centers (IEEE 802.15.4a style).
     ch_map = {
         5: 6489.6e6,
+        7: 6489.6e6,
+        8: 7488.0e6,
         9: 7987.2e6,
+        10: 8486.4e6,
     }
     if channel not in ch_map:
         raise ValueError(f"Unsupported UWB channel {channel}. Supported: {list(ch_map.keys())}")
@@ -191,6 +194,7 @@ class FullStackConfig:
     auto_bias_calibrate: bool = False
     auto_range_bias_calibrate: bool = False
     toa_calibration_override: float | None = None
+    toa_calibration_use_runtime_channel: bool = False
     lna_p1db_dbm: float | None = None
     lna_max_gain_db: float = 0.0
     adc_clip_dbfs: float | None = None
@@ -198,6 +202,12 @@ class FullStackConfig:
     wifi_oob_atten_db: float | None = None
     nf_db: float = 6.0
     temperature_k: float = 290.0
+    distance_adaptive_multipath: bool = False
+    channel_delays_s: tuple[float, ...] = (0.0, 4e-9, 8e-9)
+    channel_powers_db: tuple[float, ...] = (0.0, -10.0, -16.0)
+    channel_k_factor_db: float = 12.0
+    channel_delay_jitter_std_ns: float = 0.0
+    channel_power_jitter_std_db: float = 0.0
     seed: int = 1234
 
 
@@ -293,6 +303,9 @@ def run_full_stack_case(
     baseline_sanity_mode: bool = False,
     case_tag: str = "case",
     n_trials: int = 200,
+    debug_first_trial: bool = True,
+    save_psd: bool = True,
+    skip_nb_control: bool = False,
 ) -> dict:
     nb_fc_hz = float(cfg.nb_center_override_hz) if cfg.nb_center_override_hz is not None else nb_center_freq_hz(cfg.nb_channel)
     uwb_fc_hz = uwb_center_freq_hz(cfg.uwb_channel)
@@ -310,95 +323,98 @@ def run_full_stack_case(
     wifi_tx = WiFiOFDMTx(rng_seed=cfg.seed, center_freq_hz=wifi_fc_hz)
     uwb_fs_hz = 499.2e6
 
-    # NB initiation/control frames
-    poll = AdvPoll(
-        init_slot_dur=10,
-        cap_dur=8,
-        supported_mod_modes=0x03,
-        smid_tlvs=[SmidTlv(tag=CFID_ADV_RESP, values=b"\x00"), SmidTlv(tag=CFID_ADV_CONF, values=b"\x00")],
-    )
-    poll_b = encode_adv_poll(poll)
-
-    resp = AdvResp(
-        rpa_hash=b"\xAA\xBB\xCC",
-        message_id=0x42,
-        nb_full_channel_map=b"\x01\x02\x03\x04\x05\x06",
-        mgmt_phy_cfg=0x21,
-        mgmt_mac_cfg=b"\x10\x11\x12\x13\x14\x15\x16",
-        ranging_phy_cfg=b"\x20\x21\x22\x23",
-        mms_num_frags=2,
-    )
-    resp_b = encode_adv_resp(resp)
-
-    conf = AdvConf(
-        rpa_hash=b"\x11\x22\x33",
-        message_id=0x42,
-        responder_addr=b"\xAA\xBB\xCC",
-        sor_time_offset=b"\x01\x02\x03",
-    )
-    conf_b = encode_adv_conf(conf)
-
-    # Try with retries on poll->resp leg.
-    control_ok = False
-    for r in range(1, 6):
-        rx_poll_at_responder = _nb_phy_send_and_receive(
-            tx_bytes=poll_b,
-            tx_nb=tx_nb,
-            rx_nb=rx_nb,
-            nb_fc_hz=nb_fc_hz,
-            cfg=cfg,
-            wifi_on=wifi_on,
-            wifi_tx=wifi_tx,
-            wifi_fc_hz=wifi_fc_hz,
-            nb_wifi_overlap=nb_wifi_overlap,
-            step_seed=cfg.seed + 1000 * r,
+    control_ok = bool(skip_nb_control)
+    nb_poll_attempts = 0
+    if not skip_nb_control:
+        # NB initiation/control frames
+        poll = AdvPoll(
+            init_slot_dur=10,
+            cap_dur=8,
+            supported_mod_modes=0x03,
+            smid_tlvs=[SmidTlv(tag=CFID_ADV_RESP, values=b"\x00"), SmidTlv(tag=CFID_ADV_CONF, values=b"\x00")],
         )
-        if rx_poll_at_responder is None:
-            continue
-        try:
-            _ = decode_adv_poll(rx_poll_at_responder)
-        except Exception:
-            continue
+        poll_b = encode_adv_poll(poll)
 
-        rx_resp_at_initiator = _nb_phy_send_and_receive(
-            tx_bytes=resp_b,
-            tx_nb=tx_nb,
-            rx_nb=rx_nb,
-            nb_fc_hz=nb_fc_hz,
-            cfg=cfg,
-            wifi_on=wifi_on,
-            wifi_tx=wifi_tx,
-            wifi_fc_hz=wifi_fc_hz,
-            nb_wifi_overlap=nb_wifi_overlap,
-            step_seed=cfg.seed + 2000 * r,
+        resp = AdvResp(
+            rpa_hash=b"\xAA\xBB\xCC",
+            message_id=0x42,
+            nb_full_channel_map=b"\x01\x02\x03\x04\x05\x06",
+            mgmt_phy_cfg=0x21,
+            mgmt_mac_cfg=b"\x10\x11\x12\x13\x14\x15\x16",
+            ranging_phy_cfg=b"\x20\x21\x22\x23",
+            mms_num_frags=2,
         )
-        if rx_resp_at_initiator is None:
-            continue
-        try:
-            _ = decode_adv_resp(rx_resp_at_initiator)
-        except Exception:
-            continue
+        resp_b = encode_adv_resp(resp)
 
-        rx_conf_at_responder = _nb_phy_send_and_receive(
-            tx_bytes=conf_b,
-            tx_nb=tx_nb,
-            rx_nb=rx_nb,
-            nb_fc_hz=nb_fc_hz,
-            cfg=cfg,
-            wifi_on=wifi_on,
-            wifi_tx=wifi_tx,
-            wifi_fc_hz=wifi_fc_hz,
-            nb_wifi_overlap=nb_wifi_overlap,
-            step_seed=cfg.seed + 3000 * r,
+        conf = AdvConf(
+            rpa_hash=b"\x11\x22\x33",
+            message_id=0x42,
+            responder_addr=b"\xAA\xBB\xCC",
+            sor_time_offset=b"\x01\x02\x03",
         )
-        if rx_conf_at_responder is None:
-            continue
-        try:
-            _ = decode_adv_conf(rx_conf_at_responder)
-            control_ok = True
-            break
-        except Exception:
-            continue
+        conf_b = encode_adv_conf(conf)
+
+        # Try with retries on poll->resp leg.
+        for r in range(1, 6):
+            nb_poll_attempts = r
+            rx_poll_at_responder = _nb_phy_send_and_receive(
+                tx_bytes=poll_b,
+                tx_nb=tx_nb,
+                rx_nb=rx_nb,
+                nb_fc_hz=nb_fc_hz,
+                cfg=cfg,
+                wifi_on=wifi_on,
+                wifi_tx=wifi_tx,
+                wifi_fc_hz=wifi_fc_hz,
+                nb_wifi_overlap=nb_wifi_overlap,
+                step_seed=cfg.seed + 1000 * r,
+            )
+            if rx_poll_at_responder is None:
+                continue
+            try:
+                _ = decode_adv_poll(rx_poll_at_responder)
+            except Exception:
+                continue
+
+            rx_resp_at_initiator = _nb_phy_send_and_receive(
+                tx_bytes=resp_b,
+                tx_nb=tx_nb,
+                rx_nb=rx_nb,
+                nb_fc_hz=nb_fc_hz,
+                cfg=cfg,
+                wifi_on=wifi_on,
+                wifi_tx=wifi_tx,
+                wifi_fc_hz=wifi_fc_hz,
+                nb_wifi_overlap=nb_wifi_overlap,
+                step_seed=cfg.seed + 2000 * r,
+            )
+            if rx_resp_at_initiator is None:
+                continue
+            try:
+                _ = decode_adv_resp(rx_resp_at_initiator)
+            except Exception:
+                continue
+
+            rx_conf_at_responder = _nb_phy_send_and_receive(
+                tx_bytes=conf_b,
+                tx_nb=tx_nb,
+                rx_nb=rx_nb,
+                nb_fc_hz=nb_fc_hz,
+                cfg=cfg,
+                wifi_on=wifi_on,
+                wifi_tx=wifi_tx,
+                wifi_fc_hz=wifi_fc_hz,
+                nb_wifi_overlap=nb_wifi_overlap,
+                step_seed=cfg.seed + 3000 * r,
+            )
+            if rx_conf_at_responder is None:
+                continue
+            try:
+                _ = decode_adv_conf(rx_conf_at_responder)
+                control_ok = True
+                break
+            except Exception:
+                continue
 
     interference_wf = None
     interference_fs_hz = None
@@ -477,6 +493,11 @@ def run_full_stack_case(
         lna_max_gain_db=cfg.lna_max_gain_db,
         adc_clip_db=cfg.adc_clip_dbfs,
         quant_bits=cfg.quant_bits,
+        channel_delays_s=cfg.channel_delays_s,
+        channel_powers_db=cfg.channel_powers_db,
+        channel_k_factor_db=cfg.channel_k_factor_db,
+        channel_delay_jitter_std_s=max(0.0, float(cfg.channel_delay_jitter_std_ns)) * 1e-9,
+        channel_power_jitter_std_db=max(0.0, float(cfg.channel_power_jitter_std_db)),
         psd_unit="dBm/MHz",
         psd_sanity_check=True,
         psd_prefix_base=f"simulation/mms/psd_{case_tag}",
@@ -485,7 +506,11 @@ def run_full_stack_case(
         toa_calibration_samples_override=cfg.toa_calibration_override,
         range_bias_correction_m=cfg.range_bias_correction_m,
         toa_calibration_distance_m=cfg.distance_m,
+        toa_calibration_use_runtime_channel=cfg.toa_calibration_use_runtime_channel,
+        distance_adaptive_multipath=cfg.distance_adaptive_multipath,
         enable_crc=True,
+        debug_first_trial=debug_first_trial,
+        save_psd=save_psd,
     )[0]
 
     return {
@@ -501,12 +526,39 @@ def run_full_stack_case(
         "uwb_wifi_overlap": uwb_wifi_overlap,
         "uwb_waveform_interference_on": bool(interference_wf is not None),
         "control_ok": control_ok,
+        "nb_poll_attempts": int(nb_poll_attempts),
+        "nb_control_retries": int(max(0, nb_poll_attempts - 1)),
         "ranging_rmse_m": perf["ranging_rmse_m"],
         "ranging_rmse_all_m": perf["ranging_rmse_all_m"],
         "ranging_bias_m": perf.get("ranging_bias_m", float("nan")),
         "ranging_std_m": perf.get("ranging_std_m", float("nan")),
         "ranging_bias_all_m": perf.get("ranging_bias_all_m", float("nan")),
         "ranging_std_all_m": perf.get("ranging_std_all_m", float("nan")),
+        "first_path_index_mean": perf.get("first_path_index_mean", float("nan")),
+        "peak_index_mean": perf.get("peak_index_mean", float("nan")),
+        "detection_threshold_abs_mean": perf.get("detection_threshold_abs_mean", float("nan")),
+        "estimated_tof_ns_mean": perf.get("estimated_tof_ns_mean", float("nan")),
+        "sample_period_ns": perf.get("sample_period_ns", float("nan")),
+        "applied_calibration_offset_ns": perf.get("applied_calibration_offset_ns", float("nan")),
+        "first_path_thr_db_mean": perf.get("first_path_thr_db_mean", float("nan")),
+        "first_path_peak_frac_mean": perf.get("first_path_peak_frac_mean", float("nan")),
+        "first_path_noise_floor_mean": perf.get("first_path_noise_floor_mean", float("nan")),
+        "first_path_thr_noise_abs_mean": perf.get("first_path_thr_noise_abs_mean", float("nan")),
+        "first_path_thr_peak_abs_mean": perf.get("first_path_thr_peak_abs_mean", float("nan")),
+        "first_path_snr_corr_db_mean": perf.get("first_path_snr_corr_db_mean", float("nan")),
+        "first_path_peak_ratio_db_mean": perf.get("first_path_peak_ratio_db_mean", float("nan")),
+        "noise_win_start_mean": perf.get("noise_win_start_mean", float("nan")),
+        "noise_win_end_mean": perf.get("noise_win_end_mean", float("nan")),
+        "first_path_fallback_rate": perf.get("first_path_fallback_rate", float("nan")),
+        "a2b1_rstu_mean": perf.get("a2b1_rstu_mean", float("nan")),
+        "b2a1_rstu_mean": perf.get("b2a1_rstu_mean", float("nan")),
+        "a2b2_rstu_mean": perf.get("a2b2_rstu_mean", float("nan")),
+        "b2a2_rstu_mean": perf.get("b2a2_rstu_mean", float("nan")),
+        "ds_ra_rstu_mean": perf.get("ds_ra_rstu_mean", float("nan")),
+        "ds_rb_rstu_mean": perf.get("ds_rb_rstu_mean", float("nan")),
+        "ds_da_rstu_mean": perf.get("ds_da_rstu_mean", float("nan")),
+        "ds_db_rstu_mean": perf.get("ds_db_rstu_mean", float("nan")),
+        "ds_tof_rstu_mean": perf.get("ds_tof_rstu_mean", float("nan")),
         "ber": perf["ber"],
         "fer": perf["fer"],
         "snr_db_avg": perf["snr_db_avg"],

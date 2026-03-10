@@ -249,6 +249,30 @@ def _ber_bpsk_awgn(snr_db: float) -> float:
     return 0.5 * math.erfc(math.sqrt(max(snr_lin, 1e-18)))
 
 
+def _distance_adaptive_channel_profile(
+    distance_m: float,
+    powers_db: tuple[float, ...],
+    k_factor_db: float,
+    near_ref_m: float = 20.0,
+    extra_mp_atten_near_db: float = 8.0,
+    extra_k_near_db: float = 6.0,
+) -> tuple[tuple[float, ...], float]:
+    """
+    Distance-adaptive LOS profile:
+    - Near distances: stronger LOS (higher K), weaker delayed taps.
+    - Far distances: fallback to configured baseline profile.
+    """
+    if len(powers_db) <= 1:
+        return powers_db, float(k_factor_db)
+    x = float(np.clip(distance_m / max(near_ref_m, 1e-6), 0.0, 1.0))
+    # x=0 near, x=1 far
+    mp_extra_db = float((1.0 - x) * max(extra_mp_atten_near_db, 0.0))
+    k_extra_db = float((1.0 - x) * max(extra_k_near_db, 0.0))
+    p = [float(powers_db[0])]
+    p.extend([float(v - mp_extra_db) for v in powers_db[1:]])
+    return tuple(p), float(k_factor_db + k_extra_db)
+
+
 def _build_rsf_template(cfg: MmsUwbConfig) -> np.ndarray:
     base = get_rsf_base_sequence(code_index=cfg.phy_uwb_mms_rsf_code_index).astype(np.float64)
     if len(base) == 0:
@@ -564,7 +588,10 @@ def _estimate_delay_samples_from_rx(
     if first_path:
         # First-path from leading-edge threshold crossing on upsampled CIR.
         # Noise is estimated from a guaranteed pre-arrival window.
-        pre_end = max(16, min(len(env_up) // 3, int(max(1, rx_lead_zeros - 1) * up)))
+        # Keep a guard from the expected first-path region.
+        # Near distances (small ToA) are sensitive when noise window gets too close.
+        noise_guard_samp = 8
+        pre_end = max(16, min(len(env_up) // 3, int(max(1, rx_lead_zeros - noise_guard_samp) * up)))
         pre_start = max(0, pre_end - max(16, 128 * up))
         noise_start_up = pre_start
         noise_end_up = pre_end
@@ -1001,6 +1028,11 @@ def auto_calibrate_toa_offset(
     nf_db: float = 6.0,
     temperature_k: float = 290.0,
     noise_bw_hz: float | None = None,
+    calibration_use_runtime_channel: bool = False,
+    cal_pathloss_exp: float = 2.0,
+    cal_delays_s: tuple[float, ...] = (0.0,),
+    cal_powers_db: tuple[float, ...] = (0.0,),
+    cal_k_factor_db: float = 40.0,
 ) -> float:
     """
     Estimate constant ToA bias (in samples) from a noiseless single-path known-distance setup.
@@ -1013,15 +1045,21 @@ def auto_calibrate_toa_offset(
     p_noise = 0.0
     errs = []
     for i in range(ntr):
+        delays_used = cal_delays_s if bool(calibration_use_runtime_channel) else (0.0,)
+        powers_used = cal_powers_db if bool(calibration_use_runtime_channel) else (0.0,)
+        k_used = float(cal_k_factor_db if bool(calibration_use_runtime_channel) else 40.0)
         wf_ch, _, _, toa_s, _ = apply_distance_rician_channel(
             wf=tx_template.astype(np.complex128),
             fs_hz=fs_hz,
             fc_hz=fc_hz,
             distance_m=float(calibration_distance_m),
-            pathloss_exp=2.0,
-            delays_s=(0.0,),
-            powers_db=(0.0,),
-            k_factor_db=40.0,
+            pathloss_exp=float(cal_pathloss_exp),
+            delays_s=delays_used,
+            powers_db=powers_used,
+            k_factor_db=k_used,
+            # For single-tap LOS calibration, avoid integer-delay quantization ripple.
+            fractional_delay=bool(len(delays_used) == 1),
+            frac_taps=33,
             include_toa=True,
             seed=99991 + i,
         )
@@ -1141,6 +1179,9 @@ def _simulate_leg(
         delays_s=delays_s,
         powers_db=powers_db,
         k_factor_db=k_factor_db,
+        # For LOS/single-path studies, keep sub-sample ToF continuity across distance.
+        fractional_delay=bool(len(delays_s) == 1),
+        frac_taps=33,
         include_toa=True,
         seed=channel_seed,
     )
@@ -1530,8 +1571,26 @@ def _simulate_leg(
         'delay_samples_int': float(delay_int_corr),
         'delay_samples_frac': delay_frac_corr,
         'delay_samples': float(delay_corr),
+        'toa_raw_samples': float(toa_raw),
+        'toa_samples_used': float(toa_samples_used),
+        'toa_calibration_samples': float(toa_calibration_samples),
         'peak_idx': float(delay_info.get('peak_idx', 0.0)),
         'peak_pos_f': float(delay_info.get('peak_pos_f', 0.0)),
+        # First-path / strongest-peak telemetry for external CSV instrumentation.
+        'k_max': float(delay_info.get('k_max', float('nan'))),
+        'k_max_refined': float(delay_info.get('k_max_refined', float('nan'))),
+        'k_fp': float(delay_info.get('k_fp', float('nan'))),
+        'fp_fallback': bool(delay_info.get('fp_fallback', False)),
+        'fp_thr_abs': float(delay_info.get('fp_thr_abs', float('nan'))),
+        'fp_thr_noise_abs': float(delay_info.get('fp_thr_noise_abs', float('nan'))),
+        'fp_thr_peak_abs': float(delay_info.get('fp_thr_peak_abs', float('nan'))),
+        'fp_noise_floor': float(delay_info.get('fp_noise_floor', float('nan'))),
+        'fp_snr_corr_db': float(delay_info.get('fp_snr_corr_db', float('nan'))),
+        'fp_thr_db': float(delay_info.get('fp_thr_db', float('nan'))),
+        'fp_peak_frac': float(delay_info.get('fp_peak_frac', float('nan'))),
+        'fp_peak_ratio_db': float(delay_info.get('fp_peak_ratio_db', float('nan'))),
+        'noise_win_start': float(delay_info.get('noise_win_start', float('nan'))),
+        'noise_win_end': float(delay_info.get('noise_win_end', float('nan'))),
         'toa_refine_fft_upsample': float(corr_upsample if toa_refine_method == "fft_upsample" else 1.0),
         'lna_gain_db': 20.0 * np.log10(max(abs(lna_gain_lin), 1e-30)),
     }
@@ -1604,6 +1663,9 @@ def simulate_mms_performance(
     channel_delays_s: tuple[float, ...] = (0.0, 6e-9, 12e-9),
     channel_powers_db: tuple[float, ...] = (0.0, -6.0, -10.0),
     channel_k_factor_db: float = 8.0,
+    channel_delay_jitter_std_s: float = 0.0,
+    channel_power_jitter_std_db: float = 0.0,
+    distance_adaptive_multipath: bool = False,
     clock_ppm_std: float = 0.0,
     baseline_sanity_mode: bool = False,
     enable_toa_calibration: bool = True,
@@ -1612,6 +1674,7 @@ def simulate_mms_performance(
     range_bias_correction_m: float = 0.0,
     toa_calibration_distance_m: float | None = None,
     toa_calibration_trials: int = 32,
+    toa_calibration_use_runtime_channel: bool = False,
     enable_crc: bool = True,
     raw_mode: bool = False,
 ) -> list[dict]:
@@ -1711,6 +1774,11 @@ def simulate_mms_performance(
             nf_db=nf_db,
             temperature_k=temperature_k,
             noise_bw_hz=uwb_noise_bw_hz,
+            calibration_use_runtime_channel=bool(toa_calibration_use_runtime_channel),
+            cal_pathloss_exp=float(channel_pathloss_exp),
+            cal_delays_s=tuple(channel_delays_s),
+            cal_powers_db=tuple(channel_powers_db),
+            cal_k_factor_db=float(channel_k_factor_db),
         )
         toa_cal_strongest = auto_calibrate_toa_offset(
             tx_template=tx_template,
@@ -1744,6 +1812,11 @@ def simulate_mms_performance(
             nf_db=nf_db,
             temperature_k=temperature_k,
             noise_bw_hz=uwb_noise_bw_hz,
+            calibration_use_runtime_channel=bool(toa_calibration_use_runtime_channel),
+            cal_pathloss_exp=float(channel_pathloss_exp),
+            cal_delays_s=tuple(channel_delays_s),
+            cal_powers_db=tuple(channel_powers_db),
+            cal_k_factor_db=float(channel_k_factor_db),
         )
         toa_calibration_samples = toa_cal_firstpath if first_path else toa_cal_strongest
     elif enable_toa_calibration:
@@ -1804,6 +1877,29 @@ def simulate_mms_performance(
         ranging_fail = 0
         sinr_acc = 0.0
         fail_reason_counts: dict[str, int] = {}
+        fp_idx_acc: list[float] = []
+        peak_idx_acc: list[float] = []
+        thr_acc: list[float] = []
+        tof_acc_ns: list[float] = []
+        fp_thr_db_acc: list[float] = []
+        fp_peak_frac_acc: list[float] = []
+        noise_floor_acc: list[float] = []
+        thr_noise_abs_acc: list[float] = []
+        thr_peak_abs_acc: list[float] = []
+        snr_corr_acc: list[float] = []
+        fp_ratio_acc: list[float] = []
+        noise_win_start_acc: list[float] = []
+        noise_win_end_acc: list[float] = []
+        fp_fallback_acc: list[float] = []
+        a2b1_acc: list[float] = []
+        b2a1_acc: list[float] = []
+        a2b2_acc: list[float] = []
+        b2a2_acc: list[float] = []
+        ra_acc: list[float] = []
+        rb_acc: list[float] = []
+        da_acc: list[float] = []
+        db_acc: list[float] = []
+        tof_rstu_acc: list[float] = []
 
         for k in range(n_trials):
             trial_seed = seed + 10000 * int(d) + k
@@ -1831,6 +1927,31 @@ def simulate_mms_performance(
             ppm_r = float(rng.normal(0.0, clock_ppm_std))
             scale_i = 1.0 + ppm_i * 1e-6
             scale_r = 1.0 + ppm_r * 1e-6
+            ch_powers_use = tuple(channel_powers_db)
+            ch_k_use = float(channel_k_factor_db)
+            ch_delays_use = tuple(channel_delays_s)
+            if bool(distance_adaptive_multipath):
+                ch_powers_use, ch_k_use = _distance_adaptive_channel_profile(
+                    distance_m=d_f,
+                    powers_db=tuple(channel_powers_db),
+                    k_factor_db=float(channel_k_factor_db),
+                )
+            if float(channel_delay_jitter_std_s) > 0.0 and len(channel_delays_s) > 1:
+                # Randomize delayed taps per trial to avoid deterministic ripple from
+                # fixed multipath geometry across distance points.
+                d_arr = np.asarray(channel_delays_s, dtype=float).copy()
+                jitter = rng.normal(0.0, float(channel_delay_jitter_std_s), size=len(d_arr) - 1)
+                d_arr[1:] = d_arr[1:] + jitter
+                d_arr[1:] = np.maximum(d_arr[1:], d_arr[0] + 1e-12)
+                d_arr[1:] = np.sort(d_arr[1:])
+                ch_delays_use = tuple(float(v) for v in d_arr)
+            if float(channel_power_jitter_std_db) > 0.0 and len(channel_powers_db) > 1:
+                # Randomize delayed-path powers to emulate changing multipath composition.
+                p_arr = np.asarray(ch_powers_use, dtype=float).copy()
+                p_arr[1:] = p_arr[1:] + rng.normal(
+                    0.0, float(channel_power_jitter_std_db), size=len(p_arr) - 1
+                )
+                ch_powers_use = tuple(float(v) for v in p_arr)
 
             a2b_1, sinr1, ok1, info1 = _simulate_leg(
                 tx_template=tx_template,
@@ -1843,9 +1964,9 @@ def simulate_mms_performance(
                 temperature_k=temperature_k,
                 noise_bw_hz=uwb_noise_bw_hz,
                 pathloss_exp=channel_pathloss_exp,
-                delays_s=channel_delays_s,
-                powers_db=channel_powers_db,
-                k_factor_db=channel_k_factor_db,
+                delays_s=ch_delays_use,
+                powers_db=ch_powers_use,
+                k_factor_db=ch_k_use,
                 channel_seed=trial_seed + 101,
                 noise_seed=trial_seed + 201,
                 detector_mode=detector_mode,
@@ -1909,9 +2030,9 @@ def simulate_mms_performance(
                 temperature_k=temperature_k,
                 noise_bw_hz=uwb_noise_bw_hz,
                 pathloss_exp=channel_pathloss_exp,
-                delays_s=channel_delays_s,
-                powers_db=channel_powers_db,
-                k_factor_db=channel_k_factor_db,
+                delays_s=ch_delays_use,
+                powers_db=ch_powers_use,
+                k_factor_db=ch_k_use,
                 channel_seed=trial_seed + 301,
                 noise_seed=trial_seed + 401,
                 detector_mode=detector_mode,
@@ -1975,9 +2096,9 @@ def simulate_mms_performance(
                 temperature_k=temperature_k,
                 noise_bw_hz=uwb_noise_bw_hz,
                 pathloss_exp=channel_pathloss_exp,
-                delays_s=channel_delays_s,
-                powers_db=channel_powers_db,
-                k_factor_db=channel_k_factor_db,
+                delays_s=ch_delays_use,
+                powers_db=ch_powers_use,
+                k_factor_db=ch_k_use,
                 channel_seed=trial_seed + 501,
                 noise_seed=trial_seed + 601,
                 detector_mode=detector_mode,
@@ -2041,9 +2162,9 @@ def simulate_mms_performance(
                 temperature_k=temperature_k,
                 noise_bw_hz=uwb_noise_bw_hz,
                 pathloss_exp=channel_pathloss_exp,
-                delays_s=channel_delays_s,
-                powers_db=channel_powers_db,
-                k_factor_db=channel_k_factor_db,
+                delays_s=ch_delays_use,
+                powers_db=ch_powers_use,
+                k_factor_db=ch_k_use,
                 channel_seed=trial_seed + 701,
                 noise_seed=trial_seed + 801,
                 detector_mode=detector_mode,
@@ -2203,6 +2324,15 @@ def simulate_mms_performance(
                 tof_est_rstu = _ds_twr_tof_rstu(i_tx1_l, i_rx1, r_rx1, r_tx1_l, i_tx2_l, i_rx2, r_rx2, r_tx2_l)
                 d_est = (tof_est_rstu * RSTU_S * C_MPS) - float(range_bias_correction_m)
                 err = (d_est - d_f)
+                ra_acc.append(float(i_rx1 - i_tx1_l))
+                rb_acc.append(float(i_rx2 - i_tx2_l))
+                da_acc.append(float(r_tx1_l - r_rx1))
+                db_acc.append(float(r_tx2_l - r_rx2))
+                tof_rstu_acc.append(float(tof_est_rstu))
+                a2b1_acc.append(float(a2b_1))
+                b2a1_acc.append(float(b2a_1))
+                a2b2_acc.append(float(a2b_2))
+                b2a2_acc.append(float(b2a_2))
                 dist_err_all_sum += err
                 dist_err_sq_all_sum += (d_est - d_f) ** 2
                 dist_all_count += 1
@@ -2211,6 +2341,20 @@ def simulate_mms_performance(
                     dist_err_sum += err
                     dist_err_sq_sum += err ** 2
                     dist_success_count += 1
+                    fp_idx_acc.append(float(info1.get("k_fp", np.nan)))
+                    peak_idx_acc.append(float(info1.get("k_max_refined", np.nan)))
+                    thr_acc.append(float(info1.get("fp_thr_abs", np.nan)))
+                    tof_acc_ns.append(float(tof_est_rstu * RSTU_S * 1e9))
+                    fp_thr_db_acc.append(float(info1.get("fp_thr_db", np.nan)))
+                    fp_peak_frac_acc.append(float(info1.get("fp_peak_frac", np.nan)))
+                    noise_floor_acc.append(float(info1.get("fp_noise_floor", np.nan)))
+                    thr_noise_abs_acc.append(float(info1.get("fp_thr_noise_abs", np.nan)))
+                    thr_peak_abs_acc.append(float(info1.get("fp_thr_peak_abs", np.nan)))
+                    snr_corr_acc.append(float(info1.get("fp_snr_corr_db", np.nan)))
+                    fp_ratio_acc.append(float(info1.get("fp_peak_ratio_db", np.nan)))
+                    noise_win_start_acc.append(float(info1.get("noise_win_start", np.nan)))
+                    noise_win_end_acc.append(float(info1.get("noise_win_end", np.nan)))
+                    fp_fallback_acc.append(1.0 if bool(info1.get("fp_fallback", False)) else 0.0)
                 else:
                     ranging_fail += 1
                     fail_reason_counts["payload_or_crc_fail"] = fail_reason_counts.get("payload_or_crc_fail", 0) + 1
@@ -2260,6 +2404,31 @@ def simulate_mms_performance(
                 "toa_calibration_samples": float(toa_calibration_samples),
                 "toa_cal_firstpath": float(toa_cal_firstpath),
                 "toa_cal_strongest": float(toa_cal_strongest),
+                "first_path_index_mean": float(np.nanmean(np.asarray(fp_idx_acc, dtype=float))) if len(fp_idx_acc) else float("nan"),
+                "peak_index_mean": float(np.nanmean(np.asarray(peak_idx_acc, dtype=float))) if len(peak_idx_acc) else float("nan"),
+                "detection_threshold_abs_mean": float(np.nanmean(np.asarray(thr_acc, dtype=float))) if len(thr_acc) else float("nan"),
+                "estimated_tof_ns_mean": float(np.nanmean(np.asarray(tof_acc_ns, dtype=float))) if len(tof_acc_ns) else float("nan"),
+                "sample_period_ns": float((1.0 / float(uwb_fs_hz)) * 1e9),
+                "applied_calibration_offset_ns": float((toa_calibration_samples / float(uwb_fs_hz)) * 1e9),
+                "first_path_thr_db_mean": float(np.nanmean(np.asarray(fp_thr_db_acc, dtype=float))) if len(fp_thr_db_acc) else float("nan"),
+                "first_path_peak_frac_mean": float(np.nanmean(np.asarray(fp_peak_frac_acc, dtype=float))) if len(fp_peak_frac_acc) else float("nan"),
+                "first_path_noise_floor_mean": float(np.nanmean(np.asarray(noise_floor_acc, dtype=float))) if len(noise_floor_acc) else float("nan"),
+                "first_path_thr_noise_abs_mean": float(np.nanmean(np.asarray(thr_noise_abs_acc, dtype=float))) if len(thr_noise_abs_acc) else float("nan"),
+                "first_path_thr_peak_abs_mean": float(np.nanmean(np.asarray(thr_peak_abs_acc, dtype=float))) if len(thr_peak_abs_acc) else float("nan"),
+                "first_path_snr_corr_db_mean": float(np.nanmean(np.asarray(snr_corr_acc, dtype=float))) if len(snr_corr_acc) else float("nan"),
+                "first_path_peak_ratio_db_mean": float(np.nanmean(np.asarray(fp_ratio_acc, dtype=float))) if len(fp_ratio_acc) else float("nan"),
+                "noise_win_start_mean": float(np.nanmean(np.asarray(noise_win_start_acc, dtype=float))) if len(noise_win_start_acc) else float("nan"),
+                "noise_win_end_mean": float(np.nanmean(np.asarray(noise_win_end_acc, dtype=float))) if len(noise_win_end_acc) else float("nan"),
+                "first_path_fallback_rate": float(np.nanmean(np.asarray(fp_fallback_acc, dtype=float))) if len(fp_fallback_acc) else float("nan"),
+                "a2b1_rstu_mean": float(np.nanmean(np.asarray(a2b1_acc, dtype=float))) if len(a2b1_acc) else float("nan"),
+                "b2a1_rstu_mean": float(np.nanmean(np.asarray(b2a1_acc, dtype=float))) if len(b2a1_acc) else float("nan"),
+                "a2b2_rstu_mean": float(np.nanmean(np.asarray(a2b2_acc, dtype=float))) if len(a2b2_acc) else float("nan"),
+                "b2a2_rstu_mean": float(np.nanmean(np.asarray(b2a2_acc, dtype=float))) if len(b2a2_acc) else float("nan"),
+                "ds_ra_rstu_mean": float(np.nanmean(np.asarray(ra_acc, dtype=float))) if len(ra_acc) else float("nan"),
+                "ds_rb_rstu_mean": float(np.nanmean(np.asarray(rb_acc, dtype=float))) if len(rb_acc) else float("nan"),
+                "ds_da_rstu_mean": float(np.nanmean(np.asarray(da_acc, dtype=float))) if len(da_acc) else float("nan"),
+                "ds_db_rstu_mean": float(np.nanmean(np.asarray(db_acc, dtype=float))) if len(db_acc) else float("nan"),
+                "ds_tof_rstu_mean": float(np.nanmean(np.asarray(tof_rstu_acc, dtype=float))) if len(tof_rstu_acc) else float("nan"),
             }
         )
     return out
